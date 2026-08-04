@@ -754,14 +754,15 @@ def gguf_clip_loader(path, dynamic=False):
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
-        if arch == "qwen2vl" or arch == "qwen3vl" or arch == "gemma4":
+        if arch == "qwen2vl" or (arch == "qwen3vl" and "model.norm.weight" in sd) or arch == "gemma4":
             vsd = gguf_mmproj_loader(path, dynamic=dynamic)
             if not vsd and arch == "qwen3vl":
                 weight = sd["model.norm.weight"].shape[0]
-                sd["model.visual.deepstack_merger_list.0.norm.weight"] = torch.zeros(4608 if weight == 4096 else 4096)
+                sd["model.visual.deepstack_merger_list.0.norm.weight"] = torch.zeros(4096 if weight < 4096 else 4608)
                 sd["model.visual.merger.linear_fc2.weight"] = torch.zeros(weight)
             else:
                 sd.update(vsd)
     else:
         pass
     return sd
+
