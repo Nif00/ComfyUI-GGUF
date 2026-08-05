@@ -757,7 +757,7 @@ def gguf_clip_loader(path, dynamic=False):
         if arch in {"qwen2vl", "qwen3vl", "gemma4"}:
             vsd = gguf_mmproj_loader(path, dynamic=dynamic)
 
-        if vsd:
+            if vsd:
         # MiniMax-H3 uses the truncated Qwen3-VL-32B encoder.
         # ComfyUI detects it by:
         #   visual.deepstack_merger_list...
@@ -765,10 +765,10 @@ def gguf_clip_loader(path, dynamic=False):
         #
         # The generic Qwen3-VL mmproj mapper produces model.visual.*,
         # which makes ComfyUI incorrectly instantiate Qwen3-VL-8B.
-            is_minimax_h3 = (
-                arch == "qwen3vl"
-                and "model.layers.49.self_attn.q_proj.weight" in sd
-            )
+                is_minimax_h3 = (
+                    arch == "qwen3vl"
+                    and "model.layers.49.self_attn.q_proj.weight" in sd
+                )
 
             if is_minimax_h3:
                 vsd = {
