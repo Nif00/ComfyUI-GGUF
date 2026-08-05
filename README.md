@@ -22,13 +22,13 @@ Note: The "Force/Set CLIP Device" is **NOT** part of this node pack. Do not inst
 To install the custom node normally, git clone this repository into your custom nodes folder (`ComfyUI/custom_nodes`) and install the only dependency for inference (`pip install --upgrade gguf`)
 
 ```
-git clone https://github.com/city96/ComfyUI-GGUF
+git clone https://github.com/Nif00/ComfyUI-GGUF
 ```
 
 To install the custom node on a standalone ComfyUI release, open a CMD inside the "ComfyUI_windows_portable" folder (where your `run_nvidia_gpu.bat` file is) and use the following commands:
 
 ```
-git clone https://github.com/city96/ComfyUI-GGUF ComfyUI/custom_nodes/ComfyUI-GGUF
+git clone https://github.com/Nif00/ComfyUI-GGUF ComfyUI/custom_nodes/ComfyUI-GGUF
 .\python_embeded\python.exe -s -m pip install -r .\ComfyUI\custom_nodes\ComfyUI-GGUF\requirements.txt
 ```
 
