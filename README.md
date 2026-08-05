@@ -1,6 +1,6 @@
 This is a fork with support for Qwen3vl architecture
 Specifically for Qwen3VL 32B for use with MiniMax H3.
-Use my quantizations for H3 [Here](https://huggingface.co/nif0/Qwen3-VL-32B-Instruct-ultra-uncensored-heretic-H3-GGUF)
+Use my quantizations for H3 [Here](https://huggingface.co/nif0/Qwen3-VL-32B-Instruct-MiniMax-H3-GGUF)
 
 
 # ComfyUI-GGUF
