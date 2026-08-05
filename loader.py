@@ -754,14 +754,41 @@ def gguf_clip_loader(path, dynamic=False):
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
-        if arch == "qwen2vl" or (arch == "qwen3vl" and "model.norm.weight" in sd) or arch == "gemma4":
+        if arch in {"qwen2vl", "qwen3vl", "gemma4"}:
             vsd = gguf_mmproj_loader(path, dynamic=dynamic)
-            if not vsd and arch == "qwen3vl":
-                weight = sd["model.norm.weight"].shape[0]
-                sd["model.visual.deepstack_merger_list.0.norm.weight"] = torch.zeros(4096 if weight < 4096 else 4608)
-                sd["model.visual.merger.linear_fc2.weight"] = torch.zeros(weight)
-            else:
-                sd.update(vsd)
+
+        if vsd:
+        # MiniMax-H3 uses the truncated Qwen3-VL-32B encoder.
+        # ComfyUI detects it by:
+        #   visual.deepstack_merger_list...
+        #   model.layers.49...
+        #
+        # The generic Qwen3-VL mmproj mapper produces model.visual.*,
+        # which makes ComfyUI incorrectly instantiate Qwen3-VL-8B.
+            is_minimax_h3 = (
+                arch == "qwen3vl"
+                and "model.layers.49.self_attn.q_proj.weight" in sd
+            )
+
+            if is_minimax_h3:
+                vsd = {
+                    (
+                        key.replace("model.visual.", "visual.", 1)
+                        if key.startswith("model.visual.")
+                        else key
+                    ): value
+                    for key, value in vsd.items()
+                }
+
+            sd.update(vsd)
+
+        elif arch == "qwen3vl" and "model.norm.weight" in sd:
+        # Generic full-model fallback only.
+            weight = sd["model.norm.weight"].shape[0]
+            sd["model.visual.deepstack_merger_list.0.norm.weight"] = torch.zeros(
+                4096 if weight < 4096 else 4608
+            )
+            sd["model.visual.merger.linear_fc2.weight"] = torch.zeros(weight)
     else:
         pass
     return sd
