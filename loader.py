@@ -18,17 +18,21 @@ VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 class LazyGGUFReader(GGUFReader):
     def _get_field_parts(self, orig_offs: int, raw_type: int):
+        # Keep offsets and lengths as native Python integers. NumPy scalar
+        # values are not accepted as slice bounds by every supported runtime.
+        orig_offs = int(orig_offs)
+        raw_type = int(raw_type)
         gtype = GGUFValueType(raw_type)
         
         if gtype == GGUFValueType.ARRAY:
             raw_itype = self._get(orig_offs, np.uint32)
             offs = orig_offs + int(raw_itype.nbytes)
             alen = self._get(offs, np.uint64)
-            array_len = alen[0]
+            array_len = int(alen[0])
 
             if array_len > 1000:
                 offs += int(alen.nbytes) 
-                sub_type = raw_itype[0]
+                sub_type = int(raw_itype[0])
                 types = [gtype, GGUFValueType(sub_type)]
                 aparts = [raw_itype, alen]
                 data_idxs = []
@@ -37,36 +41,39 @@ class LazyGGUFReader(GGUFReader):
                 
                 if sub_type == 8:
                     for _ in range(array_len):
-                        slen_arr = data_view[offs : offs + 8]
+                        start = int(offs)
+                        slen_arr = data_view[start : start + 8]
                         slen = slen_arr.view(dtype=np.uint64)[0]
                         if is_swapped:
                             slen = slen.newbyteorder('S')
                         
                         str_total_bytes = 8 + int(slen)
-                        sdata_arr = data_view[offs + 8 : offs + str_total_bytes]
+                        sdata_arr = data_view[start + 8 : start + str_total_bytes]
                         
                         idxs_offs = len(aparts)
                         aparts.append(slen_arr)
                         aparts.append(sdata_arr)
                         data_idxs.append(idxs_offs + 1)                      
-                        offs += str_total_bytes
+                        offs = start + str_total_bytes
 
-                    return offs - orig_offs, aparts, data_idxs, types
+                    return int(offs - orig_offs), aparts, data_idxs, types
                 else:
                     nptype = self.gguf_scalar_to_np.get(GGUFValueType(sub_type))
                     if nptype is not None:
-                        item_size = np.dtype(nptype).itemsize
-                        total_bytes = array_len * item_size
-                        total_data = data_view[offs : offs + total_bytes].view(dtype=nptype)
+                        item_size = int(np.dtype(nptype).itemsize)
+                        total_bytes = int(array_len * item_size)
+                        start = int(offs)
+                        end = start + total_bytes
+                        total_data = data_view[start : end].view(dtype=nptype)
                         if is_swapped:
                             total_data = total_data.newbyteorder('S')
                         
                         idxs_offs = len(aparts)
                         aparts.extend(total_data[i : i + 1] for i in range(array_len))
                         data_idxs = list(range(idxs_offs, idxs_offs + array_len))                      
-                        offs += total_bytes
+                        offs = end
 
-                        return offs - orig_offs, aparts, data_idxs, types
+                        return int(offs - orig_offs), aparts, data_idxs, types
 
         return super()._get_field_parts(orig_offs, raw_type)
 
@@ -713,6 +720,24 @@ def gguf_json_tokenizer_loader(path):
         warnings.filterwarnings("ignore", message="The given buffer is not writable")
         return torch.frombuffer(tokenizer_bytes, dtype=torch.uint8)
 
+def inject_qwen3vl_detection_markers(sd):
+    """Add visual sentinels when a Qwen3-VL GGUF has no usable mmproj."""
+    ln_key = "model.layers.0.input_layernorm.weight"
+    lm_hidden = int(sd[ln_key].shape[0]) if ln_key in sd else 2560
+    vis_hidden = 1024 if lm_hidden == 2560 else 1152
+    merge_dim = vis_hidden * 4
+
+    if lm_hidden == 5120:
+        # MiniMax H3 uses the truncated Qwen3-VL-32B encoder. Its detector
+        # expects an unprefixed visual marker together with layer 49.
+        marker_key = "visual.deepstack_merger_list.0.norm.weight"
+    else:
+        marker_key = "model.visual.deepstack_merger_list.0.norm.weight"
+
+    sd[marker_key] = torch.zeros(merge_dim)
+    if lm_hidden != 5120:
+        sd["model.visual.merger.linear_fc2.weight"] = torch.zeros(lm_hidden, merge_dim)
+
 def gguf_clip_loader(path, dynamic=False):
     sd, extra = gguf_sd_loader(path, is_text_model=True, dynamic=dynamic)
     arch = extra.get("arch_str", None)
@@ -758,37 +783,30 @@ def gguf_clip_loader(path, dynamic=False):
             vsd = gguf_mmproj_loader(path, dynamic=dynamic)
 
             if vsd:
-        # MiniMax-H3 uses the truncated Qwen3-VL-32B encoder.
-        # ComfyUI detects it by:
-        #   visual.deepstack_merger_list...
-        #   model.layers.49...
-        #
-        # The generic Qwen3-VL mmproj mapper produces model.visual.*,
-        # which makes ComfyUI incorrectly instantiate Qwen3-VL-8B.
-                is_minimax_h3 = (
+                # MiniMax H3 uses the truncated Qwen3-VL-32B encoder.
+                # ComfyUI detects it by an unprefixed visual marker and
+                # layer 49. The generic Qwen3-VL mmproj mapper produces
+                # model.visual.* keys, so normalize those keys only for H3.
+                if (
                     arch == "qwen3vl"
                     and "model.layers.49.self_attn.q_proj.weight" in sd
-                )
+                ):
+                    vsd = {
+                        (
+                            key.replace("model.visual.", "visual.", 1)
+                            if key.startswith("model.visual.")
+                            else key
+                        ): value
+                        for key, value in vsd.items()
+                    }
 
-            if is_minimax_h3:
-                vsd = {
-                    (
-                        key.replace("model.visual.", "visual.", 1)
-                        if key.startswith("model.visual.")
-                        else key
-                    ): value
-                    for key, value in vsd.items()
-                }
+                sd.update(vsd)
 
-            sd.update(vsd)
-
-        elif arch == "qwen3vl" and "model.norm.weight" in sd:
-        # Generic full-model fallback only.
-            weight = sd["model.norm.weight"].shape[0]
-            sd["model.visual.deepstack_merger_list.0.norm.weight"] = torch.zeros(
-                4096 if weight < 4096 else 4608
-            )
-            sd["model.visual.merger.linear_fc2.weight"] = torch.zeros(weight)
+            elif arch == "qwen3vl":
+                # A missing or unsupported mmproj must not prevent the text
+                # encoder from loading. Add correctly-shaped detection
+                # markers so ComfyUI selects the Qwen3-VL implementation.
+                inject_qwen3vl_detection_markers(sd)
     else:
         pass
     return sd
