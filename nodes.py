@@ -469,11 +469,7 @@ class CLIPLoaderGGUF:
 
     def load_patcher(self, clip_paths, clip_type, clip_data):
         class GGUFTextOps(GGMLOps):
-            qwen35_text_only = any(
-                "model.language_model.layers.0.linear_attn.A_log" in sd
-                and not any(key.startswith("model.visual.") or key.startswith("visual.") for key in sd)
-                for sd in clip_data
-            )
+            qwen35_text_only = _qwen35_text_only(clip_data)
 
         clip = comfy.sd.load_text_encoder_state_dicts(
             clip_type = clip_type,
@@ -491,6 +487,26 @@ class CLIPLoaderGGUF:
         clip_path = folder_paths.get_full_path("clip", clip_name)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
+
+
+def _qwen35_text_only(clip_data):
+    return any(
+        "model.language_model.layers.0.linear_attn.A_log" in sd
+        and not any(key.startswith("model.visual.") or key.startswith("visual.") for key in sd)
+        for sd in clip_data
+    )
+
+
+class GGUFDynamicTextOps(comfy.ops.manual_cast):
+    class Embedding(comfy.ops.manual_cast.Embedding):
+        def forward_comfy_cast_weights(self, input, out_dtype=None):
+            # ComfyUI's Embedding casts with dtype=None, which its cast path
+            # treats as a dtype change and answers by dequantizing the whole
+            # packed vocab table on every call; name the weight's own dtype.
+            with comfy.ops.CastBiasWeightContext(self, device=input.device, dtype=self.weight.dtype, offloadable=True) as (weight, _bias):
+                return torch.nn.functional.embedding(
+                    input, weight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse,
+                ).to(dtype=out_dtype)
 
 
 def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False, progress=None):
@@ -516,6 +532,10 @@ def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False, progre
     }
     if disable_dynamic:
         model_options["custom_operations"] = GGMLOps
+    elif all(path.endswith(".gguf") for path in clip_paths):
+        class GGUFTextOps(GGUFDynamicTextOps):
+            qwen35_text_only = _qwen35_text_only(clip_data)
+        model_options["custom_operations"] = GGUFTextOps
 
     clip = comfy.sd.load_text_encoder_state_dicts(
         clip_type=clip_type,
