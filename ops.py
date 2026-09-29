@@ -7,7 +7,8 @@ import logging
 import comfy.ops
 import comfy.lora
 import comfy.model_management
-from .dequant import dequantize_tensor, is_quantized
+from .dequant import dequantize, dequantize_functions, dequantize_tensor, is_quantized
+from .quant_matmul import can_use_k_quant_matmul, k_quant_matmul, pin_host_weight
 
 def _valid_compute_dtype(dtype):
     return dtype in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
@@ -20,6 +21,36 @@ def _infer_compute_dtype(tensor_type, fallback=None):
     if tensor_type == gguf.GGMLQuantizationType.F32:
         return torch.float32
     return torch.float16
+
+def _to_device_arg(args, kwargs):
+    """Parse the device requested by a ``Tensor.to`` call (``args`` excludes self)."""
+    device = kwargs.get("device")
+    if device is not None:
+        return device
+    for arg in args:
+        if isinstance(arg, (torch.dtype, bool)):
+            continue
+        if isinstance(arg, torch.Tensor):
+            return arg.device
+        if isinstance(arg, (torch.device, str)):
+            return arg
+    return None
+
+def _to_requested_dtype(args, kwargs):
+    """Parse the dtype requested by a ``Tensor.to`` call (``args`` excludes self)."""
+    dtype = kwargs.get("dtype")
+    if dtype is not None:
+        return dtype
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            return arg.dtype
+        if isinstance(arg, torch.dtype):
+            return arg
+        if isinstance(arg, tuple):
+            for item in arg:
+                if isinstance(item, torch.dtype):
+                    return item
+    return None
 
 def chained_hasattr(obj, chained_attr):
     probe = obj
@@ -68,13 +99,89 @@ class GGMLTensor(torch.Tensor):
     def __new__(cls, *args, tensor_type, tensor_shape, patches=[], compute_dtype=None, **kwargs):
         return super().__new__(cls, *args, **kwargs)
 
-    def to(self, *args, **kwargs):
-        new = super().to(*args, **kwargs)
+    # Value ops that may receive a packed weight from comfy's cast paths
+    # (``CastBiasWeightContext``, ``model_management.cast_to``, ...). Packed
+    # blocks must be dequantized before they reach any of them.
+    _PACKED_WEIGHT_OPS = {
+        "linear", "matmul", "mm", "bmm", "embedding",
+        "conv1d", "conv2d", "conv3d",
+        "conv_transpose1d", "conv_transpose2d", "conv_transpose3d",
+    }
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        name = getattr(func, "__name__", "")
+        if name in cls._PACKED_WEIGHT_OPS:
+            operands = list(args) + list(kwargs.values())
+            if any(isinstance(a, GGMLTensor) and is_quantized(a) for a in operands):
+                if name == "linear":
+                    input_tensor = args[0] if args else kwargs.get("input")
+                    weight = args[1] if len(args) > 1 else kwargs.get("weight")
+                    # The fused kernel consumes the packed bytes directly and
+                    # never materializes a dense weight.
+                    if weight.supports_fused_linear(input_tensor):
+                        return weight.fused_linear(input_tensor, args[2] if len(args) > 2 else kwargs.get("bias"))
+                # activations precede weights in every supported signature
+                dtype = next(
+                    (a.dtype for a in operands if isinstance(a, torch.Tensor) and a.dtype.is_floating_point),
+                    None,
+                )
+
+                def dense(tensor):
+                    if isinstance(tensor, GGMLTensor) and is_quantized(tensor):
+                        return dequantize_weight(tensor, dtype or tensor.dtype)
+                    return tensor
+
+                return func(*(dense(a) for a in args), **{k: dense(v) for k, v in kwargs.items()})
+        return super().__torch_function__(func, types, args, kwargs)
+
+    def supports_fused_linear(self, input):
+        return (
+            self.device == input.device
+            and not getattr(self, "patches", ())
+            and can_use_k_quant_matmul(getattr(self, "tensor_type", None), getattr(self, "tensor_shape", ()), input)
+        )
+
+    def fused_linear(self, input, bias=None):
+        return k_quant_matmul(
+            input, self.as_subclass(torch.Tensor), self.tensor_type, self.tensor_shape,
+            bias, getattr(self, "gguf_postprocess", ()),
+        )
+
+    def _copy_meta(self, new):
         new.tensor_type = getattr(self, "tensor_type", None)
         new.tensor_shape = getattr(self, "tensor_shape", new.data.shape)
         new.patches = getattr(self, "patches", []).copy()
         new.compute_dtype = getattr(self, "compute_dtype", None)
+        new.gguf_postprocess = getattr(self, "gguf_postprocess", ())
+        new.native_matmul = getattr(self, "native_matmul", False)
         return new
+
+    def to(self, *args, **kwargs):
+        target_dtype = _to_requested_dtype(args, kwargs)
+        if is_quantized(self) and target_dtype is not None:
+            # Converting packed quant blocks as values would corrupt them, so a
+            # dtype request never reaches the storage.
+            shape = getattr(self, "tensor_shape", ())
+            if len(shape) == 2 and _valid_compute_dtype(target_dtype) and not getattr(self, "patches", ()):
+                # Linear weights are dtype-agnostic while packed: record the
+                # requested compute dtype and let ``__torch_function__`` compute
+                # from the packed storage. Materializing here costs the full
+                # dense weight (2 GiB for a 9B lm_head) on every MTP verify.
+                # Patched weights keep the dense path so the patch machinery
+                # (``GGMLModelPatcher`` weight functions) sees real values.
+                device = _to_device_arg(args, kwargs)
+                new = self if device is None or torch.device(device) == self.device else self._copy_meta(super().to(device=device))
+                new.compute_dtype = target_dtype
+                return new
+            dense = dequantize_weight(self, target_dtype)
+            device = _to_device_arg(args, kwargs)
+            if device is not None and torch.device(device) != dense.device:
+                dense = dense.to(device=device)
+            return dense
+        return self._copy_meta(super().to(*args, **kwargs))
 
     def clone(self, *args, **kwargs):
         return self
@@ -92,13 +199,8 @@ class GGMLTensor(torch.Tensor):
     def new_empty(self, size, *args, **kwargs):
         # Intel Arc fix, ref#50
         new_tensor = super().new_empty(size, *args, **kwargs)
-        return GGMLTensor(
-                new_tensor,
-                tensor_type = getattr(self, "tensor_type", None),
-                tensor_shape = size,
-                patches = getattr(self, "patches", []).copy(),
-                compute_dtype = getattr(self, "compute_dtype", None),
-        )
+        self._copy_meta(new_tensor).tensor_shape = size
+        return new_tensor
 
     @property
     def dtype(self):
@@ -177,7 +279,15 @@ class GGMLLayer(torch.nn.Module):
 
     def ggml_save_to_state_dict(self, destination, prefix, keep_vars):
         # This is a fake state dict for vram estimation
-        weight = torch.zeros_like(self.weight, device=torch.device("meta"))
+        if getattr(self.weight, "native_matmul", False):
+            # Native K-quant matmul consumes the packed bytes directly, so its
+            # resident size is the physical GGUF storage rather than FP16.
+            physical = torch.Tensor(self.weight)
+            weight = torch.empty(
+                physical.numel(), dtype=physical.dtype, device=torch.device("meta"),
+            )
+        else:
+            weight = torch.zeros_like(self.weight, device=torch.device("meta"))
         destination[prefix + "weight"] = weight
         if self.bias is not None:
             bias = torch.zeros_like(self.bias, device=torch.device("meta"))
@@ -199,29 +309,11 @@ class GGMLLayer(torch.nn.Module):
     def get_weight(self, tensor, dtype):
         if tensor is None:
             return
-
-        # consolidate and load patches to GPU in async
-        patch_list = []
-        device = tensor.device
-        for patches, key in getattr(tensor, "patches", []):
-            patch_list += move_patch_to_device(patches, device)
-
-        # dequantize tensor while patches load
-        weight = dequantize_tensor(tensor, dtype, self.dequant_dtype)
-
-        # prevent propagating custom tensor class
-        if isinstance(weight, GGMLTensor):
-            weight = torch.Tensor(weight)
-
-        # apply patches
-        if len(patch_list) > 0:
-            if self.patch_dtype is None:
-                weight = comfy.lora.calculate_weight(patch_list, weight, key)
-            else:
-                # for testing, may degrade image quality
-                patch_dtype = dtype if self.patch_dtype == "target" else self.patch_dtype
-                weight = comfy.lora.calculate_weight(patch_list, weight, key, patch_dtype)
-        return weight
+        patch_dtype = None
+        if self.patch_dtype is not None:
+            # for testing, may degrade image quality
+            patch_dtype = dtype if self.patch_dtype == "target" else self.patch_dtype
+        return dequantize_weight(tensor, dtype, self.dequant_dtype, patch_dtype)
 
     @torch_compiler_disable()
     def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None):
@@ -239,7 +331,7 @@ class GGMLLayer(torch.nn.Module):
             bias = s.get_weight(s.bias.to(device), dtype)
             bias = comfy.ops.cast_to(bias, bias_dtype, device, non_blocking=non_blocking, copy=False)
 
-        weight = s.get_weight(s.weight.to(device), dtype)
+        weight = s.get_weight(pin_host_weight(s.weight).to(device, non_blocking=non_blocking), dtype)
         weight = comfy.ops.cast_to(weight, dtype, device, non_blocking=non_blocking, copy=False)
         return weight, bias
 
@@ -275,6 +367,8 @@ class GGMLOps(comfy.ops.manual_cast):
             self.bias_comfy_model_dtype = dtype
 
         def forward_ggml_cast_weights(self, input):
+            if self.weight.supports_fused_linear(input):
+                return self.weight.fused_linear(input, self.bias)
             weight, bias = self.cast_bias_weight(input)
             return torch.nn.functional.linear(input, weight, bias)
 
@@ -285,6 +379,26 @@ class GGMLOps(comfy.ops.manual_cast):
 
     class Embedding(GGMLLayer, comfy.ops.manual_cast.Embedding):
         def forward_ggml_cast_weights(self, input, out_dtype=None):
+            weight = self.weight
+            qtype = getattr(weight, "tensor_type", None)
+            shape = getattr(weight, "tensor_shape", None)
+            if (
+                is_quantized(weight)
+                and qtype in dequantize_functions
+                and shape is not None and len(shape) == 2
+                and shape[1] % gguf.GGML_QUANT_SIZES[qtype][0] == 0
+                and not getattr(weight, "patches", ())
+                and not getattr(weight, "gguf_postprocess", ())
+            ):
+                # Gather the packed rows for the requested ids and dequantize
+                # only those; materializing the full vocab table is gigabytes.
+                rows, columns = map(int, shape)
+                packed = (weight if type(weight) is torch.Tensor else weight.as_subclass(torch.Tensor)).reshape(rows, -1)
+                ids = input.reshape(-1).to(packed.device)
+                selected = packed.index_select(0, ids).to(input.device, non_blocking=True)
+                dtype = out_dtype or _infer_compute_dtype(qtype, weight.compute_dtype)
+                result = dequantize(selected, qtype, torch.Size((ids.numel(), columns)), dtype=dtype)
+                return result.reshape(*input.shape, columns)
             output_dtype = out_dtype
             if self.weight.dtype == torch.float16 or self.weight.dtype == torch.bfloat16:
                 out_dtype = None
@@ -314,6 +428,34 @@ def move_patch_to_device(item, device):
         return [move_patch_to_device(x, device) for x in item]
     else:
         return item
+
+def dequantize_weight(tensor, dtype, dequant_dtype=None, patch_dtype=None):
+    """Dense weights for a packed GGUF tensor with any attached patches applied.
+
+    Shared by the layer forwards (via ``GGMLLayer.get_weight``) and by
+    ``GGMLTensor.__torch_function__``, which materializes weights handed to
+    value ops outside of a layer forward (comfy's cast paths). ``patch_dtype``
+    is the weighted-patch compute dtype (``None`` keeps the lora default).
+    """
+    # consolidate and load patches to GPU in async
+    patch_list = []
+    key = None
+    for patches, key in getattr(tensor, "patches", ()):
+        patch_list += move_patch_to_device(patches, tensor.device)
+
+    # dequantize tensor while patches load
+    weight = dequantize_tensor(tensor, dtype, dequant_dtype)
+
+    # prevent propagating custom tensor class
+    if isinstance(weight, GGMLTensor):
+        weight = torch.Tensor(weight)
+
+    if len(patch_list) > 0:
+        if patch_dtype is None:
+            weight = comfy.lora.calculate_weight(patch_list, weight, key)
+        else:
+            weight = comfy.lora.calculate_weight(patch_list, weight, key, patch_dtype)
+    return weight
 
 def get_gguf_q8_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
     """

@@ -52,8 +52,28 @@ Initial support for quantizing T5 has also been added recently, these can be use
 - [t5_v1.1-xxl GGUF](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
 - [Qwen3-VL-4B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF) 🍴
 - [Qwen3-VL-32B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-VL-32B-Instruct-GGUF) 🍴
+- Qwen3.5 dense GGUF text encoders, including the Qwen-Image 2.1 9B encoder 🍴
 
 See the instructions in the [tools](https://github.com/city96/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants.
+
+### Qwen3.5 runtime notes
+
+Qwen3.5 text encoders can generate with speculative MTP decoding when the GGUF
+carries a draft head (`blk.N.*`) or when one is supplied separately:
+
+- `CLIPLoader (GGUF)` uses the MTP head embedded in the encoder file.
+- `CLIPLoader (GGUF + MTP)` takes a second GGUF containing only the draft head,
+  so an encoder without one can be paired with it. `tools/extract_mtp.py`
+  writes such a sidecar from any qwen35 GGUF.
+
+Generation falls back to plain decoding when no draft head is present.
+
+By default the encoder runs eagerly. `COMFYUI_GGUF_COMPILE_TRUNK=1` compiles
+the decoder trunk with `torch.compile` instead, which cuts the per-token kernel
+count from about 2000 to about 500 and the launch time from 58 ms to 14 ms, but
+measured end-to-end speed is a wash and the fused kernels round slightly
+differently, so generated tokens change. It needs a C++ toolchain (MSVC on
+Windows) and adds 37 s (cached) to 137 s (cold) of compile time per model.
 
 ## Converting Krea 2, Ideogram 4, and Minimax M3 models
 

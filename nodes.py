@@ -16,7 +16,7 @@ import comfy.memory_management
 import folder_paths
 
 from .ops import GGMLOps, get_gguf_q8_ops, move_patch_to_device
-from .loader import gguf_sd_loader, gguf_clip_loader, gguf_tensor_count
+from .loader import gguf_sd_loader, gguf_clip_loader, gguf_mtp_loader, gguf_tensor_count
 from .dequant import is_quantized, is_torch_compatible
 from .tools.convert import QUANT_TYPE_MAP, TARGET_SIZE_QUANT_TYPE, convert_file
 
@@ -468,11 +468,18 @@ class CLIPLoaderGGUF:
         return clip_data
 
     def load_patcher(self, clip_paths, clip_type, clip_data):
+        class GGUFTextOps(GGMLOps):
+            qwen35_text_only = any(
+                "model.language_model.layers.0.linear_attn.A_log" in sd
+                and not any(key.startswith("model.visual.") or key.startswith("visual.") for key in sd)
+                for sd in clip_data
+            )
+
         clip = comfy.sd.load_text_encoder_state_dicts(
             clip_type = clip_type,
             state_dicts = clip_data,
             model_options = {
-                "custom_operations": GGMLOps,
+                "custom_operations": GGUFTextOps,
                 "initial_device": comfy.model_management.text_encoder_offload_device()
             },
             embedding_directory = folder_paths.get_folder_paths("embeddings"),
@@ -649,10 +656,36 @@ class QuadrupleCLIPLoaderGGUFDynamicVRAM(QuadrupleCLIPLoaderGGUF):
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (_load_dynamic_gguf_clip(clip_paths, clip_type),)
 
+class CLIPLoaderGGUFMTP(CLIPLoaderGGUF):
+    """CLIPLoader with a second selector for an MTP draft-head GGUF."""
+
+    TITLE = "CLIPLoader (GGUF + MTP)"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        base = nodes.CLIPLoader.INPUT_TYPES()
+        return {
+            "required": {
+                "clip_name": (s.get_filename_list(),),
+                "type": base["required"]["type"],
+                "mtp_name": (s.get_filename_list(),),
+            }
+        }
+
+    def load_clip(self, clip_name, type="stable_diffusion", mtp_name=""):
+        clip_path = folder_paths.get_full_path("clip", clip_name)
+        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+        clip_data = self.load_data([clip_path])
+        if mtp_name:
+            mtp_path = folder_paths.get_full_path("clip", mtp_name)
+            clip_data[0].update(gguf_mtp_loader(mtp_path))
+        return (self.load_patcher([clip_path], clip_type, clip_data),)
+
 NODE_CLASS_MAPPINGS = {
     "TargetedQuantizationGGUF": TargetedQuantizationGGUF,
     "UnetLoaderGGUF": UnetLoaderGGUF,
     "CLIPLoaderGGUF": CLIPLoaderGGUF,
+    "CLIPLoaderGGUFMTP": CLIPLoaderGGUFMTP,
     "DualCLIPLoaderGGUF": DualCLIPLoaderGGUF,
     "TripleCLIPLoaderGGUF": TripleCLIPLoaderGGUF,
     "QuadrupleCLIPLoaderGGUF": QuadrupleCLIPLoaderGGUF,

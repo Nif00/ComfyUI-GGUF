@@ -1,10 +1,13 @@
 import unittest
 from collections import OrderedDict
 import importlib.util
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import gguf
+import numpy as np
 import torch
 import comfy.sd
 from safetensors.torch import save_file
@@ -106,6 +109,200 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
             state_dict["model.visual.merger.linear_fc2.weight"].shape,
             (4096, 4608),
         )
+
+
+class Qwen35LoaderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.loader = load_gguf_loader()
+
+    def test_maps_hybrid_attention_keys_for_comfy_detection(self):
+        state_dict = {
+            "blk.0.attn_norm.weight": torch.zeros(4096),
+            "blk.0.attn_qkv.weight": torch.zeros(8192, 4096),
+            "blk.0.ssm_a": -torch.ones(32),
+            "blk.0.post_attention_norm.weight": torch.zeros(4096),
+        }
+
+        state_dict = self.loader.sd_map_replace(state_dict, self.loader.QWEN35_SD_MAP)
+
+        self.assertIn("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", state_dict)
+        self.assertIn("model.language_model.layers.0.linear_attn.A_log", state_dict)
+        self.assertEqual(comfy.sd.detect_te_model(state_dict), comfy.sd.TEModel.QWEN35_9B)
+
+    def test_reverses_llamacpp_value_head_tiling(self):
+        grouped = torch.arange(2 * 3 * 2).reshape(2, 3, 2)
+        tiled = grouped.permute(1, 0, 2).contiguous().reshape(-1)
+        transform = (("qwen35_inverse_v_heads", 0, 0, 2, 3, 2),)
+
+        restored = self.loader.apply_tensor_postprocess(tiled, transform)
+
+        self.assertTrue(torch.equal(restored, grouped.reshape(-1)))
+
+    def test_folds_add_one_norms_once(self):
+        # ComfyUI's checkpoint norms add one to their weight every forward; the
+        # loader bakes that in so the per-step temporary and kernel disappear.
+        import comfy.text_encoders.llama as llama_enc
+
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.input_layernorm = llama_enc.RMSNorm(8, eps=1e-5, add=True)
+                self.plain = llama_enc.RMSNorm(8, eps=1e-5, add=False)
+
+        block = Block()
+        with torch.no_grad():
+            block.input_layernorm.weight.copy_(torch.linspace(0.5, 1.5, 8))
+            block.plain.weight.copy_(torch.linspace(-0.5, 0.5, 8))
+        x = torch.randn(2, 8)
+        before = block.input_layernorm(x)
+        original_weight = block.input_layernorm.weight
+        original_values = original_weight.detach().clone()
+        folded_weight = original_weight + 1.0
+
+        self.loader.fold_add_one_norms(block)
+
+        self.assertIs(block.input_layernorm.add, False)
+        self.assertIs(block.plain.add, False)
+        self.assertTrue(torch.equal(block.input_layernorm.weight, folded_weight))
+        self.assertTrue(torch.equal(block.input_layernorm(x), before))
+        self.assertTrue(torch.equal(block.plain(x), block.plain(x)))
+        # the weight is replaced, never written through: GGUF weights can be
+        # views of the read-only file mapping
+        self.assertIsNot(block.input_layernorm.weight, original_weight)
+        self.assertTrue(torch.equal(original_weight.detach(), original_values))
+
+        # a repeat call must not add one twice
+        self.loader.fold_add_one_norms(block)
+        self.assertTrue(torch.equal(block.input_layernorm.weight, folded_weight))
+
+    def test_compile_trunk_is_opt_in(self):
+        # Off by default, and a compiler failure must leave the model eager.
+        model = torch.nn.Linear(4, 4)
+        eager_forward = model.forward
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COMFYUI_GGUF_COMPILE_TRUNK", None)
+            self.assertIsNone(self.loader.compile_gguf_trunk(model))
+
+        with mock.patch.dict(os.environ, {"COMFYUI_GGUF_COMPILE_TRUNK": "1"}), \
+             mock.patch.object(self.loader.torch, "compile", side_effect=RuntimeError("no compiler")):
+            self.assertIsNone(self.loader.compile_gguf_trunk(model))
+        self.assertEqual(model.forward, eager_forward, "failed compile must restore the eager forward")
+
+    def test_reverses_norm_and_a_log_conversion(self):
+        state_dict = {
+            "model.language_model.layers.0.input_layernorm.weight": torch.tensor([1.25]),
+            "model.language_model.layers.0.linear_attn.norm.weight": torch.tensor([0.5]),
+            "model.language_model.layers.0.linear_attn.A_log": torch.tensor([-torch.exp(torch.tensor(2.0))]),
+            "model.language_model.layers.0.linear_attn.conv1d.weight": torch.zeros(8, 4),
+        }
+
+        corrected = self.loader.qwen35_corrections(state_dict)
+
+        self.assertTrue(torch.allclose(corrected["model.language_model.layers.0.input_layernorm.weight"], torch.tensor([0.25])))
+        self.assertTrue(torch.equal(corrected["model.language_model.layers.0.linear_attn.norm.weight"], torch.tensor([0.5])))
+        self.assertTrue(torch.allclose(corrected["model.language_model.layers.0.linear_attn.A_log"], torch.tensor([2.0])))
+        self.assertEqual(
+            corrected["model.language_model.layers.0.linear_attn.conv1d.weight"].shape,
+            (8, 1, 4),
+        )
+
+    def test_installs_quantized_qwen35_logits_path(self):
+        from types import SimpleNamespace
+        import comfy.text_encoders.qwen35
+        from comfyui_gguf_test.loader.ops import GGMLOps
+
+        self.assertTrue(comfy.text_encoders.qwen35.Qwen35._comfyui_gguf_logits)
+        source = np.arange(128, dtype=np.float32).reshape(4, 32)
+        packed = gguf.quants.quantize(source, gguf.GGMLQuantizationType.Q8_0)
+        layer = GGMLOps.Linear(32, 4, bias=False)
+        layer.load_state_dict(
+            {"weight": self.loader.GGMLTensor(
+                torch.from_numpy(packed),
+                tensor_type=gguf.GGMLQuantizationType.Q8_0,
+                tensor_shape=torch.Size(source.shape),
+            )},
+            strict=False,
+        )
+        model = SimpleNamespace(model=SimpleNamespace(lm_head=layer))
+        model._gguf_logits_weight_cache = {}
+        original_cast_bias_weight = layer.cast_bias_weight
+        cast_calls = 0
+
+        def counted_cast_bias_weight(input_tensor):
+            nonlocal cast_calls
+            cast_calls += 1
+            return original_cast_bias_weight(input_tensor)
+
+        layer.cast_bias_weight = counted_cast_bias_weight
+
+        logits_first = comfy.text_encoders.qwen35.Qwen35.logits(
+            model, torch.ones(1, 2, 32, dtype=torch.float16)
+        )
+        logits_second = comfy.text_encoders.qwen35.Qwen35.logits(
+            model, torch.ones(1, 2, 32, dtype=torch.float16)
+        )
+
+        self.assertEqual(logits_first.shape, (1, 1, 4))
+        self.assertEqual(logits_second.shape, (1, 1, 4))
+        self.assertEqual(cast_calls, 1)
+        self.assertEqual(len(model._gguf_logits_weight_cache), 1)
+        self.assertIsInstance(layer.weight, self.loader.GGMLTensor)
+
+    def test_gguf_logits_support_covers_llama_family_embed_tie(self):
+        from types import SimpleNamespace
+        import comfy.text_encoders.llama
+        from comfyui_gguf_test.loader.ops import GGMLOps
+
+        self.assertTrue(comfy.text_encoders.llama.BaseGenerate._comfyui_gguf_logits)
+        source = np.arange(128, dtype=np.float32).reshape(4, 32)
+        packed = gguf.quants.quantize(source, gguf.GGMLQuantizationType.Q8_0)
+        embedding = GGMLOps.Embedding(4, 32)
+        embedding.load_state_dict(
+            {"weight": self.loader.GGMLTensor(
+                torch.from_numpy(packed),
+                tensor_type=gguf.GGMLQuantizationType.Q8_0,
+                tensor_shape=torch.Size(source.shape),
+            )},
+            strict=False,
+        )
+        model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embedding))
+        model._gguf_logits_weight_cache = {}
+        x = torch.ones(1, 2, 32, dtype=torch.float16)
+        reference = torch.nn.functional.linear(
+            x[:, -1:].float(),
+            self.loader.dequantize_tensor(embedding.weight, torch.float32),
+            None,
+        )
+
+        for logits_fn in (comfy.text_encoders.llama.BaseGenerate.logits,
+                          comfy.text_encoders.llama.BaseQwen3.logits):
+            logits = logits_fn(model, x)
+            self.assertEqual(tuple(logits.shape), (1, 1, 4))
+            self.assertTrue(
+                torch.allclose(logits.float(), reference, atol=5e-2, rtol=1e-2)
+            )
+        self.assertEqual(len(model._gguf_logits_weight_cache), 1)
+
+    def test_materializes_quantized_decode_gate_weights(self):
+        source = np.arange(128, dtype=np.float32).reshape(4, 32)
+        packed = gguf.quants.quantize(source, gguf.GGMLQuantizationType.Q8_0)
+        state_dict = {}
+        for gate in ("in_proj_a", "in_proj_b"):
+            state_dict[f"model.language_model.layers.0.linear_attn.{gate}.weight"] = (
+                self.loader.GGMLTensor(
+                    torch.from_numpy(packed.copy()),
+                    tensor_type=gguf.GGMLQuantizationType.Q8_0,
+                    tensor_shape=torch.Size(source.shape),
+                )
+            )
+
+        corrected = self.loader.qwen35_corrections(state_dict)
+
+        for value in corrected.values():
+            self.assertNotIsInstance(value, self.loader.GGMLTensor)
+            self.assertEqual(value.shape, source.shape)
 
 
 class MinimaxH3DetectionTests(unittest.TestCase):
