@@ -438,7 +438,13 @@ class CLIPLoaderGGUF:
             "required": {
                 "clip_name": (s.get_filename_list(),),
                 "type": base["required"]["type"],
-            }
+            },
+            "optional": {
+                "mmproj": (["auto", "none"] + [f for f in s.get_filename_list() if f.lower().endswith(".gguf") and "mmproj" in f.lower()], {
+                    "default": "auto",
+                    "tooltip": "Vision tower for Qwen2-VL / Qwen3.5 GGUFs. auto uses the mmproj file whose name contains the model's name, none loads text only.",
+                }),
+            },
         }
 
     RETURN_TYPES = ("CLIP",)
@@ -453,12 +459,12 @@ class CLIPLoaderGGUF:
         files += folder_paths.get_filename_list("clip_gguf")
         return sorted(files)
 
-    def load_data(self, ckpt_paths):
+    def load_data(self, ckpt_paths, mmproj="auto"):
         clip_data = []
         progress = GGUFLoadProgress(ckpt_paths)
         for p in ckpt_paths:
             if p.endswith(".gguf"):
-                sd = gguf_clip_loader(p, progress_callback=progress.callback_for(p))
+                sd = gguf_clip_loader(p, progress_callback=progress.callback_for(p), mmproj=mmproj)
             else:
                 sd = comfy.utils.load_torch_file(p, safe_load=True)
                 if "scaled_fp8" in sd: # NOTE: Scaled FP8 would require different custom ops, but only one can be active
@@ -483,10 +489,16 @@ class CLIPLoaderGGUF:
         clip.patcher = GGUFModelPatcher.clone(clip.patcher)
         return clip
 
-    def load_clip(self, clip_name, type="stable_diffusion"):
+    def load_clip(self, clip_name, type="stable_diffusion", mmproj="auto"):
         clip_path = folder_paths.get_full_path("clip", clip_name)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
+        return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path], _mmproj_path(mmproj))),)
+
+
+def _mmproj_path(mmproj):
+    if mmproj in ("auto", "none"):
+        return mmproj
+    return folder_paths.get_full_path("clip", mmproj) or folder_paths.get_full_path_or_raise("clip_gguf", mmproj)
 
 
 def _qwen35_text_only(clip_data):
@@ -509,7 +521,7 @@ class GGUFDynamicTextOps(comfy.ops.manual_cast):
                 ).to(dtype=out_dtype)
 
 
-def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False, progress=None):
+def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False, progress=None, mmproj="auto"):
     if not disable_dynamic:
         _require_dynamic_vram()
     progress = progress or GGUFLoadProgress(clip_paths)
@@ -521,6 +533,7 @@ def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False, progre
                     path,
                     dynamic=not disable_dynamic,
                     progress_callback=progress.callback_for(path),
+                    mmproj=mmproj,
                 )
             )
         else:
@@ -549,25 +562,26 @@ def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False, progre
         if disable_dynamic
         else _clone_as_dynamic_gguf_patcher(clip.patcher)
     )
-    clip.patcher.cached_patcher_init = (_load_dynamic_gguf_clip_patcher, (clip_paths, clip_type))
+    clip.patcher.cached_patcher_init = (_load_dynamic_gguf_clip_patcher, (clip_paths, clip_type, mmproj))
     return clip
 
 
-def _load_dynamic_gguf_clip_patcher(clip_paths, clip_type, disable_dynamic=False):
+def _load_dynamic_gguf_clip_patcher(clip_paths, clip_type, mmproj="auto", disable_dynamic=False):
     return _load_dynamic_gguf_clip(
         clip_paths,
         clip_type,
         disable_dynamic=disable_dynamic,
+        mmproj=mmproj,
     ).patcher
 
 
 class CLIPLoaderGGUFDynamicVRAM(CLIPLoaderGGUF):
     TITLE = "CLIPLoader (Dynamic VRAM)"
 
-    def load_clip(self, clip_name, type="stable_diffusion"):
+    def load_clip(self, clip_name, type="stable_diffusion", mmproj="auto"):
         clip_path = folder_paths.get_full_path("clip", clip_name)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (_load_dynamic_gguf_clip([clip_path], clip_type, progress=GGUFLoadProgress([clip_path])),)
+        return (_load_dynamic_gguf_clip([clip_path], clip_type, progress=GGUFLoadProgress([clip_path]), mmproj=_mmproj_path(mmproj)),)
 
 class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod

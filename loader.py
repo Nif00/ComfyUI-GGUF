@@ -498,6 +498,23 @@ CLIP_VISION_SD_MAP = {
     "ln2.": "norm2.",
 }
 
+# Qwen3.5 mmproj (llama.cpp ``qwen3vl_merger`` projector): fused attn_qkv and
+# a linear_fc merger. "v.blk." must be replaced before the per-block names.
+CLIP_VISION_QWEN35_MAP = {
+    "v.blk.": "visual.blocks.",
+    "attn_qkv": "attn.qkv",
+    "attn_out": "attn.proj",
+    "ffn_up": "mlp.linear_fc1",
+    "ffn_down": "mlp.linear_fc2",
+    "ln1.": "norm1.",
+    "ln2.": "norm2.",
+    "mm.0.": "visual.merger.linear_fc1.",
+    "mm.2.": "visual.merger.linear_fc2.",
+    "v.post_ln.": "visual.merger.norm.",
+    "v.patch_embd.": "visual.patch_embed.proj.",
+    "v.position_embd.": "visual.pos_embed.",
+}
+
 def sd_map_replace(raw_sd, key_map):
     sd = {}
     for k,v in raw_sd.items():
@@ -639,8 +656,8 @@ def compile_gguf_trunk(model):
 class MissingVisionTower(torch.nn.Module):
     def forward(self, *args, **kwargs):
         raise RuntimeError(
-            "This Qwen3.5 GGUF has no vision tower, so it cannot take image inputs. "
-            "Disconnect the image from the node, or use a model that includes its vision weights."
+            "This Qwen3.5 text encoder was loaded without a vision tower, so it cannot take image inputs. "
+            "Pick an mmproj file on the GGUF CLIP loader's mmproj input, or disconnect the image."
         )
 
 
@@ -797,48 +814,42 @@ def install_gguf_logits_support():
 install_gguf_logits_support()
 
 def strip_quant_suffix(name):
-    pattern = r"[-_]?(?:ud-)?i?q[0-9]_[a-z0-9_\-]{1,8}$"
+    pattern = r"[-_.]?(?:ud-)?i?q[0-9]_[a-z0-9_\-]{1,8}$"
     match = re.search(pattern, name, re.IGNORECASE)
     if match:
         name = name[:match.start()]
     return name
 
-def gguf_mmproj_loader(path):
-    # Reverse version of Qwen2VLVisionModel.modify_tensors
-    logging.info("Attenpting to find mmproj file for text encoder...")
-
+def find_mmproj(path):
+    """The mmproj GGUF next to ``path`` whose name contains the text encoder's name, if any."""
     # get name to match w/o quant suffix
     tenc_fname = os.path.basename(path)
-    tenc = os.path.splitext(tenc_fname)[0].lower()
-    tenc = strip_quant_suffix(tenc)
+    tenc = strip_quant_suffix(os.path.splitext(tenc_fname)[0].lower())
 
-    # try and find matching mmproj
     target = []
     root = os.path.dirname(path)
     for fname in os.listdir(root):
         name, ext = os.path.splitext(fname)
-        if ext.lower() != ".gguf":
-            continue
-        if "mmproj" not in name.lower():
-            continue
-        if tenc in name.lower():
+        if ext.lower() == ".gguf" and "mmproj" in name.lower() and tenc in name.lower():
             target.append(fname)
 
-    if len(target) == 0:
-        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')! Qwen-Image-Edit will be broken!")
-        return {}
     if len(target) > 1:
-        logging.error(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
+        logging.warning(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
+    return os.path.join(root, target[0]) if target else None
 
-    logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
-    target = os.path.join(root, target[0])
-    vsd, _ = gguf_sd_loader(target, is_text_model=True)
+def gguf_mmproj_loader(path, arch, dynamic=False):
+    # Reverse version of Qwen2VLVisionModel.modify_tensors
+    logging.info(f"Using mmproj '{os.path.basename(path)}'.")
+    vsd, _ = gguf_sd_loader(path, is_text_model=True, dynamic=dynamic)
 
     # concat 4D to 5D
     if "v.patch_embd.weight.1" in vsd:
         w1 = dequantize_tensor(vsd.pop("v.patch_embd.weight"), dtype=torch.float32)
         w2 = dequantize_tensor(vsd.pop("v.patch_embd.weight.1"), dtype=torch.float32)
         vsd["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
+
+    if arch == "qwen35":
+        return sd_map_replace(vsd, CLIP_VISION_QWEN35_MAP)
 
     # run main replacement
     vsd = sd_map_replace(vsd, CLIP_VISION_SD_MAP)
@@ -1146,7 +1157,8 @@ def gguf_mtp_loader(path):
     return mtp_sd
 
 
-def gguf_clip_loader(path, dynamic=False, progress_callback=None):
+def gguf_clip_loader(path, dynamic=False, progress_callback=None, mmproj="auto"):
+    """``mmproj`` is "auto" (a name-matched file next to ``path``), "none", or a file path."""
     sd, extra = gguf_sd_loader(
         path,
         is_text_model=True,
@@ -1186,13 +1198,19 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
             sd = sd_map_replace(sd, QWEN35_SD_MAP)
             sd.update(mtp_sd)
             sd = qwen35_corrections(sd)
+            mmproj_path = find_mmproj(path) if mmproj == "auto" else None if mmproj == "none" else mmproj
+            if mmproj_path is not None:
+                sd.update(gguf_mmproj_loader(mmproj_path, arch, dynamic=dynamic))
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
-        if arch == "qwen2vl":
-            vsd = gguf_mmproj_loader(path)
-            sd.update(vsd)
+        if arch == "qwen2vl" and mmproj != "none":
+            mmproj_path = find_mmproj(path) if mmproj == "auto" else mmproj
+            if mmproj_path is None:
+                logging.error(f"Error: Can't find mmproj file for '{os.path.basename(path)}'! Qwen-Image-Edit will be broken!")
+            else:
+                sd.update(gguf_mmproj_loader(mmproj_path, arch, dynamic=dynamic))
         if arch == "qwen3vl" and "model.visual.deepstack_merger_list.0.norm.weight" not in sd:
             # Standard llama.cpp Qwen3-VL GGUFs omit the visual tower. Without it,
             # detect_te_model() mis-classifies the state dict as a Qwen3 LM instead
