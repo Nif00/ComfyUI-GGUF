@@ -273,7 +273,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
             state_dict[sd_key].gguf_postprocess = qwen35_postprocess.get(tensor_name, ())
 
-        if arch_str == "qwen35" and k_quant_matmul_available() and len(shape) == 2 and tensor.tensor_type in {
+        if arch_str in {"qwen35", "qwen3vl"} and k_quant_matmul_available() and len(shape) == 2 and tensor.tensor_type in {
             gguf.GGMLQuantizationType.Q3_K,
             gguf.GGMLQuantizationType.Q4_K,
             gguf.GGMLQuantizationType.Q5_K,
@@ -307,7 +307,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     qsd = {k:v for k,v in state_dict.items() if is_quantized(v)}
     if len(qsd) > 0:
         estimate_candidates = qsd
-        if arch_str == "qwen35":
+        if arch_str in {"qwen35", "qwen3vl"}:
             estimate_candidates = {
                 k: v for k, v in qsd.items()
                 if k not in {"token_embd.weight", "output.weight"}
@@ -1184,10 +1184,11 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None, mmproj="auto")
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
             elif arch == "gemma3":
                 sd["spiece_model"] = gguf_gemma3_tokenizer_loader(path)
-            # Qwen3.5 K-quant embeddings gather and dequantize only the rows
-            # requested by the tokenizer; other architectures retain the
-            # compatibility fallback that materializes the whole table.
-            if arch != "qwen35":
+            # Qwen3.5 / Qwen3-VL embeddings gather and dequantize only the rows
+            # requested by the tokenizer. A dense table is 1+ GiB that DynamicVRAM
+            # re-streams every token when it does not fit; other architectures
+            # retain the compatibility fallback that materializes it.
+            if arch not in {"qwen35", "qwen3vl"}:
                 logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
                 sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         if arch == "gemma3":
