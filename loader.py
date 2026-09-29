@@ -636,6 +636,14 @@ def compile_gguf_trunk(model):
     return eager
 
 
+class MissingVisionTower(torch.nn.Module):
+    def forward(self, *args, **kwargs):
+        raise RuntimeError(
+            "This Qwen3.5 GGUF has no vision tower, so it cannot take image inputs. "
+            "Disconnect the image from the node, or use a model that includes its vision weights."
+        )
+
+
 def install_gguf_logits_support():
     """Route and cache GGUF output projections during generation.
 
@@ -707,7 +715,7 @@ def install_gguf_logits_support():
             # generic Qwen3.5 wrapper otherwise allocates an uninitialized
             # 1.7 GiB visual tower, crowding packed language weights off GPU.
             del self.visual
-            self.visual = None
+            self.visual = MissingVisionTower()
 
     qwen35_cls.__init__ = init
 
